@@ -22,6 +22,112 @@ class GameSequencePredictor:
         self.best_model_name = None
         self.feature_names = []
         
+    def calculate_rsi(self, prices, period=14):
+        """Calculate RSI without TA-Lib"""
+        if len(prices) < period + 1:
+            return 50.0  # neutral RSI
+        
+        prices = np.array(prices)
+        deltas = np.diff(prices)
+        
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains[-period:])
+        avg_loss = np.mean(losses[-period:])
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    def calculate_bollinger_bands(self, prices, period=20, std_dev=2):
+        """Calculate Bollinger Bands without TA-Lib"""
+        if len(prices) < period:
+            mean_price = np.mean(prices)
+            return mean_price * 1.02, mean_price, mean_price * 0.98, 0.5
+        
+        prices = np.array(prices)
+        sma = np.mean(prices[-period:])
+        std = np.std(prices[-period:])
+        
+        upper = sma + (std * std_dev)
+        lower = sma - (std * std_dev)
+        
+        # Calculate position within bands
+        current_price = prices[-1]
+        if upper == lower:
+            position = 0.5
+        else:
+            position = (current_price - lower) / (upper - lower)
+            position = max(0, min(1, position))  # Clamp between 0 and 1
+        
+        return upper, sma, lower, position
+    
+    def calculate_ema(self, prices, period=12):
+        """Calculate Exponential Moving Average"""
+        if len(prices) < 2:
+            return np.mean(prices) if prices else 0
+        
+        prices = np.array(prices)
+        alpha = 2 / (period + 1)
+        ema = prices[0]
+        
+        for price in prices[1:]:
+            ema = alpha * price + (1 - alpha) * ema
+        
+        return ema
+    
+    def create_enhanced_targets(self, sequence, i):
+        """Create multiple enhanced target types"""
+        if i+1 >= len(sequence):
+            return None, None, None, None
+        
+        current = sequence[i]
+        next_val = sequence[i+1]
+        
+        # Calculate percentage change
+        pct_change = (next_val - current) / (current + 1e-8)
+        
+        # 1. Magnitude-based direction (5 classes) - More granular than original
+        if pct_change > 0.15:  # 15% increase - big jump
+            magnitude_class = 4  # much_higher
+        elif pct_change > 0.03:  # 3% increase - moderate jump
+            magnitude_class = 3  # higher
+        elif pct_change < -0.15:  # 15% decrease - big drop
+            magnitude_class = 0  # much_lower
+        elif pct_change < -0.03:  # 3% decrease - moderate drop
+            magnitude_class = 1  # lower
+        else:
+            magnitude_class = 2  # same/stable
+        
+        # 2. Volatility class (3 classes) - predict if next change will be volatile
+        volatility_class = 2 if abs(pct_change) > 0.2 else (1 if abs(pct_change) > 0.05 else 0)  # high/medium/low volatility
+        
+        # 3. Threshold class (3 classes) - specific to your domain
+        if next_val > 10.0:
+            threshold_class = 2  # very_high
+        elif next_val > 3.0:
+            threshold_class = 1  # high
+        else:
+            threshold_class = 0  # normal/low
+        
+        # 4. Trend class (3 classes) - predict trend direction
+        if i >= 4:  # Need at least 5 points for trend
+            recent_trend = np.polyfit(range(5), sequence[i-4:i+1], 1)[0]
+            if recent_trend > 0.1:
+                trend_class = 2  # uptrend
+            elif recent_trend < -0.1:
+                trend_class = 0  # downtrend
+            else:
+                trend_class = 1  # sideways
+        else:
+            trend_class = 1  # neutral
+        
+        return magnitude_class, volatility_class, threshold_class, trend_class
+        
     def create_features_from_sequence(self, sequence):
         """
         Create features from a sequence of game results
@@ -46,11 +152,22 @@ class GameSequencePredictor:
             var_recent = np.var(recent_window)
             std_recent = np.std(recent_window)
             median_recent = np.median(recent_window)
-            
             # Statistical features from all history
             mean_all = np.mean(current_window)
             var_all = np.var(current_window)
             std_all = np.std(current_window)
+            
+            # Advanced statistical features
+            rolling_skew = skew(recent_window) if len(recent_window) >= 3 else 0.0
+            rolling_kurtosis = kurtosis(recent_window) if len(recent_window) >= 3 else 0.0
+            
+            # Technical indicators
+            rsi = self.calculate_rsi(recent_window, period=min(14, len(recent_window)))
+            bb_upper, bb_middle, bb_lower, bb_position = self.calculate_bollinger_bands(recent_window, 
+                                                                                       period=min(20, len(recent_window)))
+            ema_short = self.calculate_ema(recent_window, period=min(12, len(recent_window)))
+            ema_long = self.calculate_ema(recent_window, period=min(26, len(recent_window)))
+            
               # Trend analysis
             if len(recent_window) >= 3:
                 # Linear trend (slope)
@@ -97,10 +214,40 @@ class GameSequencePredictor:
             percentile_25 = np.percentile(recent_window, 25)
             percentile_75 = np.percentile(recent_window, 75)
             iqr = percentile_75 - percentile_25
-            
-            # Frequency features (how often we see similar values)
+              # Frequency features (how often we see similar values)
             current_val = sequence[i]
             similar_count = np.sum(np.abs(recent_window - current_val) < 0.1)
+            
+            # Consecutive patterns
+            consecutive_up = 0
+            consecutive_down = 0
+            for j in range(min(5, len(recent_window)-1)):
+                if recent_window[-(j+1)] > recent_window[-(j+2)]:
+                    consecutive_up += 1
+                else:
+                    break
+            for j in range(min(5, len(recent_window)-1)):
+                if recent_window[-(j+1)] < recent_window[-(j+2)]:
+                    consecutive_down += 1
+                else:
+                    break
+            
+            # Local extrema detection
+            is_local_max = (i >= 2 and sequence[i] > sequence[i-1] and sequence[i-1] > sequence[i-2])
+            is_local_min = (i >= 2 and sequence[i] < sequence[i-1] and sequence[i-1] < sequence[i-2])
+            
+            # Time since last extreme
+            time_since_max = 1
+            time_since_min = 1
+            max_val = sequence[i]
+            min_val = sequence[i]
+            for j in range(1, min(20, i+1)):
+                if sequence[i-j] > max_val:
+                    max_val = sequence[i-j]
+                    time_since_max = j
+                if sequence[i-j] < min_val:
+                    min_val = sequence[i-j]
+                    time_since_min = j
             
             # Rolling statistics with different windows
             rolling_features = {}
@@ -146,6 +293,20 @@ class GameSequencePredictor:
                 next_approximate = mean_recent
                 next_exp_smooth = mean_recent
             
+            # Get enhanced targets
+            magnitude_target, volatility_target, threshold_target, trend_target = self.create_enhanced_targets(sequence, i)
+            
+            # Original simple target
+            if i+1 < len(sequence):
+                if sequence[i+1] > sequence[i] + 1e-4:
+                    direction = 1
+                elif sequence[i+1] < sequence[i] - 1e-4:
+                    direction = -1
+                else:
+                    direction = 0
+            else:
+                direction = None
+            
             # Combine all features
             feature_row = {
                 # Basic statistics
@@ -156,6 +317,17 @@ class GameSequencePredictor:
                 'mean_all': mean_all,
                 'var_all': var_all,
                 'std_all': std_all,
+                
+                # Advanced statistics
+                'rolling_skew': rolling_skew,
+                'rolling_kurtosis': rolling_kurtosis,
+                
+                # Technical indicators
+                'rsi': rsi,
+                'bb_position': bb_position,
+                'ema_short': ema_short,
+                'ema_long': ema_long,
+                'ema_diff': ema_short - ema_long,
                 
                 # Trend and momentum
                 'trend_slope': trend_slope,
@@ -171,6 +343,12 @@ class GameSequencePredictor:
                 'percentile_25': percentile_25,
                 'percentile_75': percentile_75,
                 'iqr': iqr,
+                'consecutive_up': consecutive_up,
+                'consecutive_down': consecutive_down,
+                'is_local_max': int(is_local_max),
+                'is_local_min': int(is_local_min),
+                'time_since_max': time_since_max,
+                'time_since_min': time_since_min,
                 
                 # Position features
                 'current_vs_mean': current_vs_mean,
@@ -186,19 +364,15 @@ class GameSequencePredictor:
                 'next_approximate': next_approximate,
                 'next_exp_smooth': next_exp_smooth,
                 
-                # Target (next value)
-                # 'target': sequence[i+1] if i+1 < len(sequence) else None
+                # Enhanced targets
+                'target_magnitude': magnitude_target,
+                'target_volatility': volatility_target,
+                'target_threshold': threshold_target,
+                'target_trend': trend_target,
+                
+                # Original target
+                'target': direction
             }
-            
-            if i+1 < len(sequence):
-                if sequence[i+1] > sequence[i] + 1e-4:
-                    direction = 1
-                elif sequence[i+1] < sequence[i] - 1e-4:
-                    direction = -1
-                else:
-                    direction = 0
-            else:
-                direction = None
 
             feature_row['target'] = direction
 
@@ -206,12 +380,13 @@ class GameSequencePredictor:
             feature_row.update(rolling_features)
             
             # Add lag features
-            feature_row.update(lag_features)
-              # Add interaction features
+            feature_row.update(lag_features)              # Add interaction features
             feature_row['mean_var_ratio'] = mean_recent / (var_recent + 1e-8)
             feature_row['mean_times_var'] = mean_recent * var_recent
             feature_row['trend_times_volatility'] = trend_slope * volatility_recent
             feature_row['momentum_times_volatility'] = momentum_1 * volatility_recent
+            feature_row['rsi_bb_interaction'] = rsi * bb_position
+            feature_row['ema_momentum_interaction'] = (ema_short - ema_long) * momentum_1
             
             # Validate all features are finite
             for key, value in feature_row.items():
@@ -224,7 +399,7 @@ class GameSequencePredictor:
                         problematic_value = True
                     
                     if problematic_value:
-                        if key == 'target':
+                        if key.startswith('target'):
                             feature_row[key] = None
                         else:
                             feature_row[key] = 0.0
@@ -318,14 +493,64 @@ class GameSequencePredictor:
         imputer = SimpleImputer(strategy='mean')
         print("Imputing remaining NaN values in features...") # DEBUG
         X_imputed = imputer.fit_transform(X)
-        X = pd.DataFrame(X_imputed, columns=feature_cols, index=X.index) # Preserve index
-        print("Finished imputing NaN values.") # DEBUG
+        X = pd.DataFrame(X_imputed, columns=feature_cols, index=X.index) # Preserve index        print("Finished imputing NaN values.") # DEBUG
         
         self.feature_names = feature_cols
         print(f"Created {len(feature_cols)} features from {len(df)} samples (derived from the long sequence)")
         print("Finished preparing training data.") # DEBUG
         
         return X, y
+    
+    def prepare_multi_target_training_data(self, full_historical_sequence):
+        """
+        Prepare training data with multiple target types
+        """
+        print("Starting to prepare multi-target training data...") # DEBUG
+        transformed_sequence = self.log_transform(full_historical_sequence)
+        
+        if len(full_historical_sequence) < 4:
+            print("Warning: Full historical sequence is too short to generate any training samples.")
+            return None, None, None, None, None, None
+        
+        # Create features from the entire historical sequence
+        df = self.create_features_from_sequence(transformed_sequence)
+        
+        # Remove rows where any target is None
+        target_cols = ['target', 'target_magnitude', 'target_volatility', 'target_threshold', 'target_trend']
+        initial_rows = len(df)
+        df = df.dropna(subset=target_cols)
+        print(f"Dropped {initial_rows - len(df)} rows with None targets")
+        
+        # Handle NaN and infinite values
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna()
+        
+        if len(df) == 0:
+            raise ValueError("No valid data remaining after cleaning.")
+        
+        # Separate features and targets
+        feature_cols = [col for col in df.columns if not col.startswith('target')]
+        X = df[feature_cols]
+        
+        # Original target (remapped)
+        y_original = df['target'].map({-1: 0, 0: 1, 1: 2})
+        
+        # Enhanced targets
+        y_magnitude = df['target_magnitude']
+        y_volatility = df['target_volatility'] 
+        y_threshold = df['target_threshold']
+        y_trend = df['target_trend']
+        
+        # Impute any remaining NaN values in features
+        from sklearn.impute import SimpleImputer
+        imputer = SimpleImputer(strategy='mean')
+        X_imputed = imputer.fit_transform(X)
+        X = pd.DataFrame(X_imputed, columns=feature_cols, index=X.index)
+        
+        self.feature_names = feature_cols
+        print(f"Created {len(feature_cols)} features from {len(df)} samples with enhanced targets")
+        
+        return X, y_original, y_magnitude, y_volatility, y_threshold, y_trend
     
     def train_models(self, X, y, test_size=0.2, tune_hyperparameters=False):
         """Train multiple models, with an option for hyperparameter tuning"""
@@ -477,23 +702,25 @@ class GameSequencePredictor:
             except Exception as e:
                 print(f"Error training {name}: {str(e)}")
                 results[name] = {'Accuracy': 0.0, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0, 'ConfusionMatrix': None, 'model': None}
+        
+        self.models = results # Ensure self.models is updated with all training results
+
         MIN_ACCEPTABLE_F1 = 0.0
-        valid_models = {
-            k: v for k, v in results.items()
+        valid_models_from_instance = { # Check against the updated self.models
+            k: v for k, v in self.models.items()
             if v['model'] is not None and v['F1'] > MIN_ACCEPTABLE_F1
         }
 
-        if valid_models:
+        if valid_models_from_instance:
             self.best_model_name = max(
-                valid_models.keys(),
-                key=lambda x: (valid_models[x]['F1'], valid_models[x]['Accuracy'])
+                valid_models_from_instance.keys(),
+                key=lambda x: (self.models[x]['F1'], self.models[x]['Accuracy']) # Access self.models
             )
-            print(f"\nBest model (F1 > {MIN_ACCEPTABLE_F1}): {self.best_model_name} (F1: {results[self.best_model_name]['F1']:.4f}, Accuracy: {results[self.best_model_name]['Accuracy']:.4f})")
+            print(f"\nBest model (F1 > {MIN_ACCEPTABLE_F1}): {self.best_model_name} (F1: {self.models[self.best_model_name]['F1']:.4f}, Accuracy: {self.models[self.best_model_name]['Accuracy']:.4f})")
         else:
             print(f"\nNo model found with F1 > {MIN_ACCEPTABLE_F1}.")
             self.best_model_name = None
-
-        self.models = results
+            # self.models = results # This line is now handled above
         return results
     
     def predict_next_value(self, sequence):
@@ -507,7 +734,9 @@ class GameSequencePredictor:
         if len(sequence) < 3:
             raise ValueError("Need at least 3 values to make a prediction")
         
-        features_df = self.create_features_from_sequence(sequence)
+        # Apply the same log transformation used during training
+        transformed_sequence = self.log_transform(sequence)
+        features_df = self.create_features_from_sequence(transformed_sequence)
         
         X = features_df[self.feature_names].iloc[[-1]]
         
@@ -592,7 +821,7 @@ def load_dataset(file_path):
 
 def example_usage():
     sample_sequences = load_dataset('../data/multipliers.csv')
-    sample_sequences = sample_sequences[:10000]
+    sample_sequences = sample_sequences[:5000]
     
     predictor = GameSequencePredictor(sequence_length=20)
     
@@ -600,8 +829,8 @@ def example_usage():
     print(X[0:5])  # Display first 5 rows of features for debugging
     print(y[0:5])  # Display first 5 target values for debugging
 
-    X_selected, selected_features = predictor.select_top_features(X, y, top_k=30)
-    predictor.feature_names = selected_features
+    # X_selected, selected_features = predictor.select_top_features(X, y, top_k=30)
+    # predictor.feature_names = selected_features
     
     results = predictor.train_models(X, y, tune_hyperparameters=False) # Set to True to run tuning
     
@@ -641,7 +870,7 @@ class FastGamePredictor:
         """Get prediction with confidence using multiple models"""
         predictions = []
         
-        # Get predictions from top N models
+        # Get predictions from top N models        
         sorted_models = sorted(
             [(name, info) for name, info in self.predictor.models.items() if info['model'] is not None],
             key=lambda x: x[1]['RMSE']
@@ -649,8 +878,10 @@ class FastGamePredictor:
         
         for name, info in sorted_models[:n_models]:
             try:
+                # Apply the same log transformation used during training
+                transformed_sequence = self.predictor.log_transform(sequence)
                 # Create features
-                features_df = self.predictor.create_features_from_sequence(sequence)
+                features_df = self.predictor.create_features_from_sequence(transformed_sequence)
                 X = features_df[self.predictor.feature_names].iloc[[-1]]
                 
                 # Apply scaling if needed
@@ -669,6 +900,189 @@ class FastGamePredictor:
         else:
             return self.predict(sequence), 0.0
 
+
+class MultiTargetGamePredictor:
+    """Enhanced predictor with multiple target types"""
+    
+    def __init__(self, sequence_length=20):
+        self.sequence_length = sequence_length
+        self.models = {
+            'original': {},
+            'magnitude': {},
+            'volatility': {},
+            'threshold': {},
+            'trend': {}
+        }
+        self.best_models = {}
+        self.scalers = {}
+        self.feature_names = []
+        self.base_predictor = GameSequencePredictor(sequence_length)
+    
+    def prepare_data(self, full_historical_sequence):
+        """Prepare data for multi-target training"""
+        return self.base_predictor.prepare_multi_target_training_data(full_historical_sequence)
+    
+    def train_multi_target_models(self, X, y_original, y_magnitude, y_volatility, y_threshold, y_trend, tune_hyperparameters=False):
+        """Train separate models for each target type"""
+        targets = {
+            'original': y_original,
+            'magnitude': y_magnitude,
+            'volatility': y_volatility,
+            'threshold': y_threshold,
+            'trend': y_trend
+        }
+        
+        self.feature_names = X.columns.tolist()
+        
+        for target_name, y in targets.items():
+            print(f"Training models for {target_name} prediction...")
+            
+            # Create a new predictor for this target
+            predictor = GameSequencePredictor(self.sequence_length)
+            predictor.feature_names = self.feature_names
+            
+            # Train models
+            results = predictor.train_models(X, y, tune_hyperparameters=tune_hyperparameters)
+            
+            self.models[target_name] = results
+            self.best_models[target_name] = predictor.best_model_name
+            if target_name == 'original':  # Copy scalers from the first trained model
+                self.scalers = predictor.scalers
+    
+    def predict_multi_target(self, sequence):
+        """Get predictions for all target types"""
+        predictions = {}
+        
+        # Apply the same log transformation used during training
+        transformed_sequence = self.base_predictor.log_transform(sequence)
+        # Create features from sequence
+        features_df = self.base_predictor.create_features_from_sequence(transformed_sequence)
+        X = features_df[self.feature_names].iloc[[-1]]
+        
+        for target_name in self.models.keys():
+            if self.best_models.get(target_name) and self.models[target_name].get(self.best_models[target_name]):
+                best_model_name = self.best_models[target_name]
+                model = self.models[target_name][best_model_name]['model']
+                
+                if model is not None:
+                    try:
+                        # Apply scaling if needed
+                        if best_model_name == 'Neural Network':
+                            X_scaled = self.scalers['robust'].transform(X)
+                            pred = model.predict(X_scaled)[0]
+                        else:
+                            pred = model.predict(X)[0]
+                        
+                        predictions[target_name] = pred
+                    except Exception as e:
+                        print(f"Error predicting {target_name}: {str(e)}")
+                        predictions[target_name] = None
+                else:
+                    predictions[target_name] = None
+            else:
+                predictions[target_name] = None
+        
+        return predictions
+    
+    def get_prediction_summary(self, sequence):
+        """Get a comprehensive prediction summary"""
+        predictions = self.predict_multi_target(sequence)
+        
+        # Map predictions to readable labels
+        direction_map = {0: 'lower', 1: 'same', 2: 'higher'}
+        magnitude_map = {0: 'much_lower', 1: 'lower', 2: 'same', 3: 'higher', 4: 'much_higher'}
+        volatility_map = {0: 'low', 1: 'medium', 2: 'high'}
+        threshold_map = {0: 'normal', 1: 'high', 2: 'very_high'}
+        trend_map = {0: 'downtrend', 1: 'sideways', 2: 'uptrend'}
+        
+        summary = {
+            'direction': direction_map.get(predictions.get('original'), 'unknown'),
+            'magnitude': magnitude_map.get(predictions.get('magnitude'), 'unknown'),
+            'volatility': volatility_map.get(predictions.get('volatility'), 'unknown'),
+            'threshold': threshold_map.get(predictions.get('threshold'), 'unknown'),
+            'trend': trend_map.get(predictions.get('trend'), 'unknown'),
+            'raw_predictions': predictions
+        }
+        
+        return summary
+    
+    def save_model(self, filepath):
+        """Save the multi-target model"""
+        model_data = {
+            'models': self.models,
+            'best_models': self.best_models,
+            'scalers': self.scalers,
+            'feature_names': self.feature_names,
+            'sequence_length': self.sequence_length
+        }
+        joblib.dump(model_data, filepath)
+        print(f"Multi-target model saved to {filepath}")
+    
+    def load_model(self, filepath):
+        """Load a pre-trained multi-target model"""
+        model_data = joblib.load(filepath)
+        self.models = model_data['models']
+        self.best_models = model_data['best_models']
+        self.scalers = model_data['scalers']
+        self.feature_names = model_data['feature_names']
+        self.sequence_length = model_data['sequence_length']
+        print(f"Multi-target model loaded from {filepath}")
+
+
+def example_usage_multi_target():
+    """Example usage of multi-target predictor"""
+    sample_sequences = load_dataset('../data/multipliers.csv')
+    sample_sequences = sample_sequences[:5000]  # Use smaller dataset for testing
+    
+    predictor = MultiTargetGamePredictor(sequence_length=20)
+    
+    # Prepare multi-target data
+    data = predictor.prepare_data(sample_sequences)
+    
+    if data[0] is not None:
+        X, y_original, y_magnitude, y_volatility, y_threshold, y_trend = data
+        print(f"Training data shape: {X.shape}")
+        print(f"Target distributions:")
+        print(f"  Original: {np.bincount(y_original)}")
+        print(f"  Magnitude: {np.bincount(y_magnitude)}")
+        print(f"  Volatility: {np.bincount(y_volatility)}")
+        print(f"  Threshold: {np.bincount(y_threshold)}")
+        print(f"  Trend: {np.bincount(y_trend)}")
+        
+        # Train multi-target models
+        predictor.train_multi_target_models(X, y_original, y_magnitude, y_volatility, y_threshold, y_trend, tune_hyperparameters=False)
+        
+        # Test prediction
+        test_sequence = [3.0, 3.89, 1.65, 4.45, 1.13, 3.8, 4.42, 5.2, 2.88, 1.96, 1.55, 13.14, 3.08, 1.13, 15.91, 10.46, 1.68, 1.58, 1.44, 2.11]
+        summary = predictor.get_prediction_summary(test_sequence)
+        
+        print(f"\nMulti-target prediction summary:")
+        print(f"  Direction: {summary['direction']}")
+        print(f"  Magnitude: {summary['magnitude']}")
+        print(f"  Volatility: {summary['volatility']}")
+        print(f"  Threshold: {summary['threshold']}")
+        print(f"  Trend: {summary['trend']}")
+        
+        # Save the model
+        predictor.save_model('multi_target_game_model.pkl')
+        
+        return predictor
+    else:
+        print("No valid training data generated.")
+        return None
+
+def main():
+    fastpredictor = FastGamePredictor('multi_target_game_model.pkl')
+    test_sequence = [3.0, 3.89, 1.65, 4.45, 1.13, 3.8, 4.42, 5.2, 2.88, 1.96, 1.55, 13.14, 3.08, 1.13, 15.91, 10.46, 1.68, 1.58, 1.44, 2.11]
+    prediction = fastpredictor.predict(test_sequence)
+    print(f"Fast prediction for sequence {test_sequence} is: {prediction}")
+
 if __name__ == "__main__":
-    # Run example
-    predictor = example_usage()
+    main()
+    # # Run original example
+    # print("=== Running Original Example ===")
+    # predictor = example_usage()
+    # 
+    # print("\n=== Running Multi-Target Example ===")
+    # # Run multi-target example
+    # multi_predictor = example_usage_multi_target()
